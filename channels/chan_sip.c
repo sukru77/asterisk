@@ -20238,6 +20238,113 @@ static int manager_show_registry(struct mansession *s, const struct message *m)
 	return 0;
 }
 
+static int show_chanstats_manager(struct sip_pvt *cur, struct mansession *s, const struct message *m, char *idtext)
+{
+	struct ast_rtp_instance_stats stats;
+	struct ast_channel *c;
+	char durbuf[10];
+
+	sip_pvt_lock(cur);
+	c = cur->owner;
+
+	if (cur->subscribed != NONE) {
+		/* Subscriptions */
+		sip_pvt_unlock(cur);
+		return 0;	/* don't care, we scan all channels */
+	}
+
+	if (!cur->rtp) {
+		/* No RTP */
+		sip_pvt_unlock(cur);
+		return 0;
+	}
+
+	if (ast_rtp_instance_get_stats(cur->rtp, &stats, AST_RTP_INSTANCE_STAT_ALL)) {
+		sip_pvt_unlock(cur);
+		return 0;
+	}
+
+	if (c) {
+		ast_format_duration_hh_mm_ss(ast_channel_get_duration(c), durbuf, sizeof(durbuf));
+	} else {
+		durbuf[0] = '\0';
+	}
+
+
+	astman_append(s,
+		"Event: SIPChannelStats\r\n%s"
+		"IP: %s\r\n"
+		"Peer: %s\r\n"
+		"Accountcode: %s\r\n"
+		"CidNum: %s\r\n"
+		"CidName: %s\r\n"
+		"CallID: %s\r\n"
+		"Duration: %s\r\n"
+		"RxCount: %d\r\n"
+		"RxLoss: %u\r\n"
+		"RxPct: %5.2f%%\r\n"
+		"RxJitter: %f\r\n"
+		"TxCount: %d\r\n"
+		"TxLoss: %u\r\n"
+		"TxPct: %5.2f%%\r\n"
+		"TxJitter: %f\r\n"
+		"\r\n",
+
+		idtext,
+
+		ast_sockaddr_stringify_addr(&cur->sa),
+
+		cur->peername,
+		cur->accountcode,
+		cur->cid_num,
+		cur->cid_name,
+		cur->callid,
+
+		durbuf,
+
+		stats.rxcount,
+		stats.rxploss,
+		(stats.rxcount + stats.rxploss) > 0 ? (double) stats.rxploss / (stats.rxcount + stats.rxploss) * 100 : 0,
+		stats.rxjitter,
+
+		stats.txcount,
+		stats.txploss,
+		stats.txcount > 0 ? (double) stats.txploss / stats.txcount * 100 : 0,
+		stats.txjitter
+	);
+
+	sip_pvt_unlock(cur);
+
+	return 1;
+}
+
+/*! \brief  Show SIP show channelstats in the manager API */
+static int manager_sip_show_channelstats(struct mansession *s, const struct message *m)
+{
+	const char *id = astman_get_header(m, "ActionID");
+	struct ao2_iterator i;
+	struct sip_pvt *cur;
+	int total = 0;
+	char idtext[256] = "";
+
+	if (!ast_strlen_zero(id))
+		snprintf(idtext, sizeof(idtext), "ActionID: %s\r\n", id);
+
+	astman_send_listack(s, m, "Channel stats list will follow", "start");
+
+	/* iterate on the container and invoke the callback on each item */
+	i = ao2_iterator_init(dialogs, 0);
+	for (; (cur = ao2_iterator_next(&i)); ao2_ref(cur, -1)) {
+		total += show_chanstats_manager(cur, s, m, idtext);
+	}
+	ao2_iterator_destroy(&i);
+
+	/* Send final confirmation */
+	astman_send_list_complete_start(s, m, "ChannelStatsComplete", total);
+	astman_send_list_complete_end(s);
+	return 0;
+}
+
 /*! \brief  Show SIP peers in the manager API */
 /*    Inspired from chan_iax2 */
 static int manager_sip_show_peers(struct mansession *s, const struct message *m)
@@ -20494,6 +20601,15 @@ static struct sip_peer *_sip_show_peers_one(int fd, struct mansession *s, struct
 		"RealtimeDevice: %s\r\n"
 		"Description: %s\r\n"
 		"Accountcode: %s\r\n"
+		"UserAgent: %s\r\n"
+		"InUse: %d\r\n"
+		"OnHold: %d\r\n"
+		"Ringing: %d\r\n"
+		"CName: %s\r\n"
+		"CNum: %s\r\n"
+		"QualifyFreq: %d\r\n"
+		"MaxMs: %d\r\n"
+		"LastMs: %d\r\n"
 		"\r\n",
 		cont->idtext,
 		peer->name,
@@ -20510,7 +20626,16 @@ static struct sip_peer *_sip_show_peers_one(int fd, struct mansession *s, struct
 		status,
 		cont->realtimepeers ? (peer->is_realtime ? "yes" : "no") : "no",
 		peer->description,
-		peer->accountcode);
+		peer->accountcode,
+        peer->useragent,
+        peer->inuse,
+		peer->onhold,
+		peer->ringing,
+		peer->cid_name,
+		peer->cid_num,
+		peer->qualifyfreq,
+		peer->maxms,
+		peer->lastms);
 	}
 	ao2_unlock(peer);
 
@@ -35643,6 +35768,7 @@ static int load_module(void)
 	ast_custom_function_register(&checksipdomain_function);
 
 	/* Register manager commands */
+	ast_manager_register_xml("SIPchannelstats", EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, manager_sip_show_channelstats);
 	ast_manager_register_xml("SIPpeers", EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, manager_sip_show_peers);
 	ast_manager_register_xml("SIPshowpeer", EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, manager_sip_show_peer);
 	ast_manager_register_xml("SIPqualifypeer", EVENT_FLAG_SYSTEM | EVENT_FLAG_REPORTING, manager_sip_qualify_peer);
@@ -35769,6 +35895,7 @@ static int unload_module(void)
 	ast_rtp_glue_unregister(&sip_rtp_glue);
 
 	/* Unregister AMI actions */
+	ast_manager_unregister("SIPchannelstats");
 	ast_manager_unregister("SIPpeers");
 	ast_manager_unregister("SIPshowpeer");
 	ast_manager_unregister("SIPqualifypeer");
