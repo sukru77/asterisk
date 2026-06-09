@@ -971,7 +971,7 @@ if test "x$have_gethostbyname_r_public_declaration" = "xyes"; then
         AC_LINK_IFELSE(
                 [AC_LANG_PROGRAM([#include <stdlib.h>
                                  #include <netdb.h>],
-                                [struct hostent *he = gethostbyname_r((const char *)NULL, (struct hostent *)NULL, (char *)NULL, (int)0, (struct hostent **)NULL, (int *)NULL);])],
+                                [int rv = gethostbyname_r((const char *)NULL, (struct hostent *)NULL, (char *)NULL, (size_t)0, (struct hostent **)NULL, (int *)NULL); (void)rv;])],
                 AC_MSG_RESULT(yes)
                 AC_DEFINE([HAVE_GETHOSTBYNAME_R_6], 1, [Define to 1 if your system has gethostbyname_r with 6 arguments.]),
                 AC_MSG_RESULT(no)

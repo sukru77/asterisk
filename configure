@@ -17930,7 +17930,7 @@ $as_echo_n "checking for gethostbyname_r with 6 arguments... " >&6; }
 int
 main ()
 {
-struct hostent *he = gethostbyname_r((const char *)NULL, (struct hostent *)NULL, (char *)NULL, (int)0, (struct hostent **)NULL, (int *)NULL);
+int rv = gethostbyname_r((const char *)NULL, (struct hostent *)NULL, (char *)NULL, (size_t)0, (struct hostent **)NULL, (int *)NULL); (void)rv;
   ;
   return 0;
 }
