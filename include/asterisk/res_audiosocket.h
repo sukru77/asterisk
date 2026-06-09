@@ -84,4 +84,19 @@ const int ast_audiosocket_send_frame(const int svc, const struct ast_frame *f);
  */
 struct ast_frame *ast_audiosocket_receive_frame(const int svc);
 
+/*!
+ * \brief Receive an Asterisk frame from an AudioSocket server
+ *
+ * Like ast_audiosocket_receive_frame(), but if the peer sends a HANGUP frame
+ * (kind 0x00), the full message is consumed and \a hangup is set to 1 when
+ * non-NULL.
+ *
+ * \param svc Socket connected to the AudioSocket server
+ * \param hangup Set to 1 on remote HANGUP; may be NULL
+ *
+ * \retval Frame on success, or NULL on error / hangup (see \a hangup)
+ */
+struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc,
+	int *const hangup);
+
 #endif /* _ASTERISK_RES_AUDIOSOCKET_H */

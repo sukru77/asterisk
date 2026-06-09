@@ -228,7 +228,7 @@ const int ast_audiosocket_send_frame(const int svc, const struct ast_frame *f)
 	return ret;
 }
 
-struct ast_frame *ast_audiosocket_receive_frame(const int svc)
+struct ast_frame *ast_audiosocket_receive_frame_with_hangup(const int svc, int *const hangup)
 {
 
 	int i = 0, n = 0, ret = 0, not_audio = 0;
@@ -244,6 +244,10 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 	uint16_t len = 0;
 	uint8_t *data;
 
+	if (hangup) {
+		*hangup = 0;
+	}
+
 	n = read(svc, &kind, 1);
 	if (n < 0 && errno == EAGAIN) {
 		return &ast_null_frame;
@@ -256,7 +260,35 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 		return NULL;
 	}
 	if (kind == 0x00) {
-		/* AudioSocket ended by remote */
+		/* HANGUP: read length and payload so the stream stays aligned */
+		n = read(svc, &len_high, 1);
+		if (n != 1) {
+			ast_log(LOG_WARNING, "Failed to read data length from AudioSocket (hangup)\n");
+			return NULL;
+		}
+		n = read(svc, &len_low, 1);
+		if (n != 1) {
+			ast_log(LOG_WARNING, "Failed to read data length from AudioSocket (hangup)\n");
+			return NULL;
+		}
+		len = (uint16_t)(len_high * 256 + len_low);
+		while (len > 0) {
+			uint8_t sink[256];
+			size_t chunk = len > sizeof(sink) ? sizeof(sink) : len;
+			n = read(svc, sink, chunk);
+			if (n < 0) {
+				ast_log(LOG_ERROR, "Failed to read hangup payload from AudioSocket\n");
+				return NULL;
+			}
+			if (n == 0) {
+				ast_log(LOG_ERROR, "Insufficient data read from AudioSocket (hangup)\n");
+				return NULL;
+			}
+			len -= (uint16_t) n;
+		}
+		if (hangup) {
+			*hangup = 1;
+		}
 		return NULL;
 	}
 	if (kind != 0x10) {
@@ -322,6 +354,11 @@ struct ast_frame *ast_audiosocket_receive_frame(const int svc)
 
 	/* The frame steals data, so it doesn't need to be freed here */
 	return ast_frisolate(&f);
+}
+
+struct ast_frame *ast_audiosocket_receive_frame(const int svc)
+{
+	return ast_audiosocket_receive_frame_with_hangup(svc, NULL);
 }
 
 static int load_module(void)

@@ -166,6 +166,7 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 	int ms = 0;
 	int outfd = -1;
 	struct ast_frame *f;
+	int hangup = 0;
 
 	if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
 		ast_log(LOG_ERROR, "Channel is %s\n", chan ? "not answered" : "missing");
@@ -201,7 +202,11 @@ static int audiosocket_run(struct ast_channel *chan, const char *id, int svc)
 		}
 
 		if (outfd >= 0) {
-			f = ast_audiosocket_receive_frame(svc);
+			f = ast_audiosocket_receive_frame_with_hangup(svc, &hangup);
+			if (hangup) {
+				/* Remote ended session (protocol HANGUP) */
+				return 0;
+			}
 			if (!f) {
 				ast_log(LOG_ERROR, "Failed to receive frame from AudioSocket message for"
 					"channel %s\n", chanName);
