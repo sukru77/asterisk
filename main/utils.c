@@ -84,7 +84,8 @@ static char b2a_url[256];
 
 AST_THREADSTORAGE(inet_ntoa_buf);
 
-#if !defined(HAVE_GETHOSTBYNAME_R_5) && !defined(HAVE_GETHOSTBYNAME_R_6)
+#if !defined(HAVE_GETHOSTBYNAME_R_5) && !defined(HAVE_GETHOSTBYNAME_R_6) \
+	&& !(defined(HAVE_DECL_GETHOSTBYNAME_R) && HAVE_DECL_GETHOSTBYNAME_R)
 
 #define ERANGE 34	/*!< duh? ERANGE value copied from web... */
 #undef gethostbyname
