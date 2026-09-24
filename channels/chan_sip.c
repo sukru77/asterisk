@@ -176,7 +176,7 @@
 /*** MODULEINFO
 	<use type="module">res_crypto</use>
 	<use type="module">res_http_websocket</use>
-	<defaultenabled>no</defaultenabled>
+	<defaultenabled>yes</defaultenabled>
 	<support_level>deprecated</support_level>
 	<replacement>chan_pjsip</replacement>
 	<deprecated_in>17</deprecated_in>
