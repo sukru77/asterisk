@@ -40,3 +40,4 @@ tests/CI/output
 .develvars
 .devcontainer/
 .claude/
+/.idea/
