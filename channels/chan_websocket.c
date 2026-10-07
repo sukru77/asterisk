@@ -68,6 +68,7 @@ static const char *msg_format_map[] = {
 struct webchan_conf_global {
 	SORCERY_OBJECT(details);
 	enum webchan_control_msg_format control_msg_format;
+	int write_timeout;
 };
 
 /* This is from the perspective of the app, NOT Asterisk */
@@ -105,6 +106,8 @@ struct websocket_pvt {
 	enum webchan_control_msg_format control_msg_format;
 	int no_auto_answer;
 	int passthrough;
+	int unbuffered;
+	int last_unbuffered;
 	int optimal_frame_size;
 	int bulk_media_in_progress;
 	int report_queue_drained;
@@ -228,7 +231,7 @@ static char *_create_event_MEDIA_START(struct websocket_pvt *instance)
 	char *payload = NULL;
 
 	if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
-		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s, s:s, s:s, s:i, s:i, s:o }",
+		struct ast_json *msg = ast_json_pack("{s:s, s:s, s:s, s:s, s:s, s:i, s:i, s:b, s:b, s:o }",
 			"event", "MEDIA_START",
 			"connection_id", instance->connection_id,
 			"channel", ast_channel_name(instance->channel),
@@ -236,6 +239,8 @@ static char *_create_event_MEDIA_START(struct websocket_pvt *instance)
 			"format", ast_format_get_name(instance->native_format),
 			"optimal_frame_size", instance->optimal_frame_size,
 			"ptime", instance->native_codec->default_ms,
+			"passthrough", instance->passthrough,
+			"unbuffered", instance->unbuffered,
 			"channel_variables", ast_json_channel_vars(ast_channel_varshead(
 						instance->channel))
 			);
@@ -245,14 +250,16 @@ static char *_create_event_MEDIA_START(struct websocket_pvt *instance)
 		payload = ast_json_dump_string_format(msg, AST_JSON_COMPACT);
 		ast_json_unref(msg);
 	} else {
-		ast_asprintf(&payload, "%s %s:%s %s:%s %s:%s %s:%s %s:%d %s:%d",
+		ast_asprintf(&payload, "%s %s:%s %s:%s %s:%s %s:%s %s:%d %s:%d %s:%s %s:%s",
 			"MEDIA_START",
 			"connection_id", instance->connection_id,
 			"channel", ast_channel_name(instance->channel),
 			"channel_id", ast_channel_uniqueid(instance->channel),
 			"format", ast_format_get_name(instance->native_format),
 			"optimal_frame_size", instance->optimal_frame_size,
-			"ptime", instance->native_codec->default_ms
+			"ptime", instance->native_codec->default_ms,
+			"passthrough", instance->passthrough ? "true" : "false",
+			"unbuffered", instance->unbuffered ? "true" : "false"
 			);
 	}
 
@@ -456,11 +463,13 @@ static __attribute__ ((format (gnu_printf, 2, 3))) char *_create_event_ERROR(
 	(_res); \
 })
 
-/*
- * Reminder...  This function gets called by webchan_read which is
- * triggered by the channel timer firing.  It always gets called
- * every 20ms (or whatever the timer is set to) even if there are
- * no frames in the queue.
+/*!
+ * \internal
+ *
+ * This function gets called by webchan_read which is triggered by the channel
+ * timer firing or by a websocket frame being received while in unbuffered mode.
+ * It always gets called at least every 20ms (or whatever the timer is set to)
+ * even if there are no frames in the queue.
  */
 static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 {
@@ -526,10 +535,15 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 			 * We just need to send the data to the websocket.
 			 * The data should already be NULL terminated.
 			 */
-			ast_websocket_write_string(instance->websocket,
+			int res = ast_websocket_write_string(instance->websocket,
 				queued_frame->data.ptr);
-			ast_debug(4, "%s: Sent %s\n",
-				ast_channel_name(instance->channel), (char *)queued_frame->data.ptr);
+			if (res != 0) {
+				ast_log(LOG_ERROR, "%s: Unable to send event %s\n",
+					ast_channel_name(instance->channel), (char *)queued_frame->data.ptr);
+			} else {
+				ast_debug(4, "%s: Sent %s\n",
+					ast_channel_name(instance->channel), (char *)queued_frame->data.ptr);
+			}
 		}
 		/*
 		 * We do NOT send these to the core so we need to free
@@ -593,8 +607,18 @@ static struct ast_frame *create_frame_from_buffer(struct websocket_pvt *instance
  *
  *   The websocket fd (WS_WEBSOCKET_FDNO) which gets triggered when
  *   there's incoming data to read from the websocket.  In this case,
- *   we read the data and put it ON the queue.  We'll return a null frame.
+ *   we read the data and put it ON the queue.  If in unbuffered mode,
+ *   we'll read it off the queue immediately and return it.  If not in
+ *   unbuffered mode, we'll return a null frame now and the frame read
+ *   will be processed by the timer tick when it comes to the head
+ *   of the queue.
  *
+ *   The reason for queueing and dequeueing immediately in unbuffered
+ *   mode is that read_from_ws_and_queue does a lot of work before adding
+ *   a frame to the frame queue, if it even needs to.  It's much simpler
+ *   to just queue and dequeue, both from a code organization standpoint
+ *   as well as an instruction-path-length standpoint, than it would be
+ *   refactor that code so it can return a frame directly.
  */
 static struct ast_frame *webchan_read(struct ast_channel *ast)
 {
@@ -607,16 +631,19 @@ static struct ast_frame *webchan_read(struct ast_channel *ast)
 		return NULL;
 	}
 
-	if (fdno == WS_WEBSOCKET_FDNO) {
-		read_from_ws_and_queue(instance);
-		return &ast_null_frame;
-	}
-	if (fdno != WS_TIMER_FDNO) {
+	if (fdno != WS_TIMER_FDNO && fdno != WS_WEBSOCKET_FDNO) {
 		return &ast_null_frame;
 	}
 
-	if (ast_timer_get_event(instance->timer) == AST_TIMING_EVENT_EXPIRED) {
-		ast_timer_ack(instance->timer, 1);
+	if (fdno == WS_WEBSOCKET_FDNO) {
+		read_from_ws_and_queue(instance);
+		if (!instance->unbuffered) {
+			return &ast_null_frame;
+		}
+	} else {
+		if (ast_timer_get_event(instance->timer) == AST_TIMING_EVENT_EXPIRED) {
+			ast_timer_ack(instance->timer, 1);
+		}
 	}
 
 	native_frame = dequeue_frame(instance);
@@ -624,18 +651,18 @@ static struct ast_frame *webchan_read(struct ast_channel *ast)
 		if (instance->leftover_len > 0) {
 			native_frame = create_frame_from_buffer(instance, instance->leftover_data, instance->leftover_len);
 			if (native_frame) {
-				ast_debug(4, "%s: WebSocket read timer fired with no frame available but with %d bytes in leftover_data.  Returning partial frame.\n",
+				ast_debug(4, "%s: Triggered with no frame available but with %d bytes in leftover_data.  Returning partial frame.\n",
 					ast_channel_name(ast), (int)instance->leftover_len);
 				instance->leftover_len = 0;
 				return native_frame;
 			}
 		}
-		ast_debug(4, "%s: WebSocket read timer fired with no frame available and no data in leftover_data.  Returning NULL frame.\n",
+		ast_debug(4, "%s: Triggered with no frame available and no data in leftover_data.  Returning NULL frame.\n",
 			ast_channel_name(ast));
 		return &ast_null_frame;
 	}
 
-	ast_debug(5, "%s: WebSocket read timer fired. Dequeued %d byte frame.  Left in buffer: %d\n",
+	ast_debug(5, "%s: Dequeued %d byte frame.  Left in buffer: %d\n",
 		ast_channel_name(ast), native_frame->datalen, (int)instance->leftover_len);
 
 	return native_frame;
@@ -705,6 +732,16 @@ static int queue_option_frame(struct websocket_pvt *instance,
 	} \
 })
 
+#define ERROR_ON_UNBUFFERED_MODE_RTN(instance, command) \
+({ \
+	if (instance->unbuffered) { \
+		send_event(instance, ERROR, "%s not supported in unbuffered mode", command); \
+		ast_debug(4, "%s: WebSocket in unbuffered mode. Ignoring %s command.\n", \
+			ast_channel_name(instance->channel), command); \
+		return 0; \
+	} \
+})
+
 #define ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, direction) \
 ({ \
 	if (instance->media_direction == direction) { \
@@ -759,8 +796,15 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 	} else if (ast_strings_equal(command, START_MEDIA_BUFFERING)) {
 		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
 		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
+		if (instance->bulk_media_in_progress) {
+			send_event(instance, ERROR, "START_MEDIA_BUFFERING can't be called when media buffering is already active.\n");
+			return 0;
+		}
+
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->bulk_media_in_progress = 1;
+		instance->last_unbuffered = instance->unbuffered;
+		instance->unbuffered = 0;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
 	} else if (ast_strings_equal(command, STOP_MEDIA_BUFFERING)) {
@@ -778,11 +822,17 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
 		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 
+		if (!instance->bulk_media_in_progress) {
+			send_event(instance, ERROR, "STOP_MEDIA_BUFFERING can't be called when media buffering isn't active.\n");
+			return 0;
+		}
+
 		ast_debug(4, "%s: WebSocket %s '%s' with %d bytes in leftover_data.\n",
 			ast_channel_name(instance->channel), STOP_MEDIA_BUFFERING, id,
 			(int)instance->leftover_len);
 
 		instance->bulk_media_in_progress = 0;
+		instance->unbuffered = instance->last_unbuffered;
 		if (instance->leftover_len > 0) {
 			res = queue_frame_from_buffer(instance, instance->leftover_data, instance->leftover_len);
 			if (res != 0) {
@@ -803,7 +853,6 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 		SCOPED_LOCK(frame_queue_lock, &instance->frame_queue, AST_LIST_LOCK,
 			AST_LIST_UNLOCK);
 
-		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
 		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 
 		if (instance->control_msg_format == WEBCHAN_CONTROL_MSG_FORMAT_JSON) {
@@ -826,6 +875,7 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 		struct ast_frame *frame = NULL;
 
 		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_UNBUFFERED_MODE_RTN(instance, command);
 
 		AST_LIST_LOCK(&instance->frame_queue);
 		while ((frame = AST_LIST_REMOVE_HEAD(&instance->frame_queue, frame_list))) {
@@ -834,6 +884,7 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 		instance->frame_queue_length = 0;
 		instance->bulk_media_in_progress = 0;
 		instance->leftover_len = 0;
+		instance->unbuffered = instance->last_unbuffered;
 		AST_LIST_UNLOCK(&instance->frame_queue);
 
 	} else if (ast_strings_equal(command, REPORT_QUEUE_DRAINED)) {
@@ -848,6 +899,7 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 
 	} else if (ast_strings_equal(command, PAUSE_MEDIA)) {
 		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_UNBUFFERED_MODE_RTN(instance, command);
 		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->queue_paused = 1;
@@ -855,6 +907,7 @@ static int handle_command(struct websocket_pvt *instance, char *buffer)
 
 	} else if (ast_strings_equal(command, CONTINUE_MEDIA)) {
 		ERROR_ON_PASSTHROUGH_MODE_RTN(instance, command);
+		ERROR_ON_UNBUFFERED_MODE_RTN(instance, command);
 		ERROR_ON_INVALID_MEDIA_DIRECTION_RTN(instance, command, WEBCHAN_MEDIA_DIRECTION_IN);
 		AST_LIST_LOCK(&instance->frame_queue);
 		instance->queue_paused = 0;
@@ -982,7 +1035,7 @@ static int process_binary_message(struct websocket_pvt *instance,
 	next_frame_ptr = payload;
 	instance->bytes_read += payload_len;
 
-	if (instance->passthrough) {
+	if (instance->unbuffered) {
 		res = queue_frame_from_buffer(instance, payload, payload_len);
 		return res;
 	}
@@ -1167,6 +1220,14 @@ static int websocket_handoff_to_channel(struct websocket_pvt *instance)
 	}
 
 	/*
+	 * The way write timeouts are handled in iostream requires the socket to be
+	 * in non-blocking mode.  This is fine for reads as well because we already
+	 * set the websocket file descriptor on the channel and let it call
+	 * webchan_read() when data is available.
+	 */
+	ast_websocket_set_nonblock(instance->websocket);
+
+	/*
 	 * Tell res_http_websocket to accumulate incoming WebSocket CONTINUATION frames
 	 * into chunks of 1024 bytes and send us a TEXT or BINARY frame when the threshold
 	 * is reached.
@@ -1219,6 +1280,7 @@ static void _websocket_request_hangup(struct websocket_pvt *instance, int ast_ca
 static int webchan_write(struct ast_channel *ast, struct ast_frame *f)
 {
 	struct websocket_pvt *instance = ast_channel_tech_pvt(ast);
+	int res = 0;
 
 	if (!instance || !instance->websocket) {
 		ast_log(LOG_WARNING, "%s: WebSocket instance or client not found\n",
@@ -1248,8 +1310,13 @@ static int webchan_write(struct ast_channel *ast, struct ast_frame *f)
 		return -1;
 	}
 
-	return ast_websocket_write(instance->websocket, AST_WEBSOCKET_OPCODE_BINARY,
+	res = ast_websocket_write(instance->websocket, AST_WEBSOCKET_OPCODE_BINARY,
 		(char *)f->data.ptr, (uint64_t)f->datalen);
+	if (res != 0) {
+		ast_log(LOG_WARNING, "%s: WebSocket write failure\n", ast_channel_name(ast));
+	}
+
+	return res;
 }
 
 /*!
@@ -1264,6 +1331,10 @@ static int webchan_call(struct ast_channel *ast, const char *dest,
 {
 	struct websocket_pvt *instance = ast_channel_tech_pvt(ast);
 	enum ast_websocket_result result;
+	struct webchan_conf_global *global_cfg = ast_sorcery_retrieve_by_id(sorcery, "global", "global");
+	int global_write_timeout = global_cfg ? global_cfg->write_timeout : AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT;
+
+	ao2_cleanup(global_cfg);
 
 	if (!instance) {
 		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n",
@@ -1299,6 +1370,21 @@ static int webchan_call(struct ast_channel *ast, const char *dest,
 			ast_channel_name(ast), dest, ast_websocket_result_to_str(result));
 		ast_channel_hangupcause_set(ast, AST_CAUSE_NO_ROUTE_DESTINATION);
 		return -1;
+	}
+
+	/*
+	 * If websocket_client->write_timeout was set in websocket_client.conf, it will
+	 * have been applied to the websocket by ast_websocket_client_connect() above.
+	 * If it wasn't set in websocket_client.conf, the value will be INT_MAX and
+	 * and ast_websocket_client_connect() will have set AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT
+	 * on the websocket.  However, the user may have set write_timeout in the global section
+	 * of chan_websocket.conf so if it wasn't set in websocket_client.conf, we'll now set
+	 * the websocket timeout to that.  If they  haven't set it in chan_websocket.conf either,
+	 * it'll default to AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT as well so the call below will
+	 * basically become a no-op.
+	 */
+	if (instance->client->write_timeout == INT_MAX) {
+		ast_websocket_set_timeout(instance->websocket, global_write_timeout);
 	}
 
 	return websocket_handoff_to_channel(instance);
@@ -1421,10 +1507,11 @@ static struct websocket_pvt* websocket_new(const char *chan_name,
 	 * It's not possible for us to re-time or re-frame media if the data
 	 * stream can't be broken up on arbitrary byte boundaries.  This is usually
 	 * indicated by the codec's minimum_bytes being small (10 bytes or less).
-	 * We need to force passthrough mode in this case.
+	 * We need to force the passthrough and unbuffered modes in this case.
 	 */
 	if (instance->native_codec->minimum_bytes <= 10) {
 		instance->passthrough = 1;
+		instance->unbuffered = 1;
 		instance->optimal_frame_size = 0;
 	} else {
 		instance->optimal_frame_size =
@@ -1537,6 +1624,7 @@ enum {
 	OPT_WS_PASSTHROUGH =  (1 << 3),
 	OPT_WS_MSG_FORMAT =  (1 << 4),
 	OPT_WS_MEDIA_DIRECTION = (1 << 5),
+	OPT_WS_UNBUFFERED = (1 << 6),
 };
 
 enum {
@@ -1546,6 +1634,7 @@ enum {
 	OPT_ARG_WS_PASSTHROUGH,
 	OPT_ARG_WS_MSG_FORMAT,
 	OPT_ARG_WS_MEDIA_DIRECTION,
+	OPT_ARG_WS_UNBUFFERED,
 	OPT_ARG_ARRAY_SIZE
 };
 
@@ -1556,6 +1645,7 @@ AST_APP_OPTIONS(websocket_options, BEGIN_OPTIONS
 	AST_APP_OPTION('p', OPT_WS_PASSTHROUGH),
 	AST_APP_OPTION_ARG('f', OPT_WS_MSG_FORMAT, OPT_ARG_WS_MSG_FORMAT),
 	AST_APP_OPTION_ARG('d', OPT_WS_MEDIA_DIRECTION, OPT_ARG_WS_MEDIA_DIRECTION),
+	AST_APP_OPTION('u', OPT_WS_UNBUFFERED),
 	END_OPTIONS );
 
 static struct ast_channel *webchan_request(const char *type,
@@ -1649,8 +1739,22 @@ static struct ast_channel *webchan_request(const char *type,
 	}
 
 	instance->no_auto_answer = ast_test_flag(&opts, OPT_WS_NO_AUTO_ANSWER);
+
+	/*
+	 * Passthrough requires unbuffered.  If passthrough was forced by choice of
+	 * codec, unbuffered will already have been set.  If passthrough was set by
+	 * the dialstring option, we need to force unbuffered.
+	 */
 	if (!instance->passthrough) {
 		instance->passthrough = ast_test_flag(&opts, OPT_WS_PASSTHROUGH);
+		instance->unbuffered = instance->passthrough;
+	}
+	/*
+	 * If unbuffered hasn't been forced by passthrough, set it according to the
+	 * dialstring "u" option.
+	 */
+	if (!instance->unbuffered) {
+		instance->unbuffered = ast_test_flag(&opts, OPT_WS_UNBUFFERED);
 	}
 
 	if (ast_test_flag(&opts, OPT_WS_URI_PARAM)
@@ -1812,6 +1916,10 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 	struct ast_variable *v;
 	const char *connection_id = NULL;
 	struct websocket_pvt *instance = NULL;
+	struct webchan_conf_global *global_cfg = ast_sorcery_retrieve_by_id(sorcery, "global", "global");
+	int global_write_timeout = global_cfg ? global_cfg->write_timeout : AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT;
+
+	ao2_cleanup(global_cfg);
 
 	ast_debug(3, "WebSocket established\n");
 
@@ -1849,6 +1957,8 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 		return;
 	}
 	instance->websocket = ao2_bump(ast_ws_session);
+
+	ast_websocket_set_timeout(instance->websocket, global_write_timeout);
 
 	websocket_handoff_to_channel(instance);
 	ao2_cleanup(instance);
@@ -2001,6 +2111,11 @@ static int global_apply(const struct ast_sorcery *sorcery, void *obj)
 	ast_debug(1, "control_msg_format: %s\n",
 		control_msg_format_to_str(cfg->control_msg_format));
 
+	if (cfg->write_timeout <= 0) {
+		ast_log(LOG_WARNING, "The write_timeout parameter must be > 0\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -2025,6 +2140,8 @@ static int load_config(void)
 
 	ast_sorcery_object_field_register_nodoc(sorcery, "global", "type", "", OPT_NOOP_T, 0, 0);
 	ast_sorcery_register_cust(global, control_message_format, "plain-text");
+	ast_sorcery_register_int(global, webchan_conf_global, write_timeout, write_timeout,
+		AST_DEFAULT_WEBSOCKET_WRITE_TIMEOUT);
 
 	ast_sorcery_load(sorcery);
 

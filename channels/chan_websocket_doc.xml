@@ -35,6 +35,34 @@
 						</enumlist>
 					</description>
 				</configOption>
+				<configOption name="write_timeout" default="100">
+					<since>
+						<version>20.22.0</version>
+						<version>22.12.0</version>
+						<version>23.6.0</version>
+						<version>24.0.0</version>
+					</since>
+					<synopsis>Write timeout (ms).</synopsis>
+					<description>
+						<para>
+							The maximum number of milliseconds to wait for a write
+							to the WebSocket to succeed. The WebSocket will be closed and the
+							channel hung up when the timeout is reached.  For outgoing
+							WebSocket connections, this sets the default timeout which can be
+							overridden in websocket_client.conf.
+						</para>
+						<note>
+							<para>
+							Success means the write request was accepted by the
+							operating system and does not imply the payload was
+							actually transmitted or received by the server.
+							</para>
+						</note>
+					</description>
+					<see-also>
+						<ref type="configOption" module="res_websocket_client">write_timeout</ref>
+					</see-also>
+				</configOption>
 			</configObject>
 		</configFile>
 	</configInfo>
@@ -106,6 +134,20 @@
 						sent to Asterisk and the MEDIA text commands that could be sent
 						over the websocket are disabled.  Currently, passthrough mode is
 						automatically set for the opus, speex and g729 codecs.
+						</para>
+					</enum>
+					<enum name="u - Unbuffered mode">
+						<para>In unbuffered mode, the channel driver won't attempt
+						to re-frame or re-time media coming in over the websocket from
+						the remote app. In this case, the remote app is fully responsible
+						for correctly framing and timing media sent to Asterisk.  This is
+						useful for when the app is getting its media from a source that's
+						already framed and timed. The difference between unbuffered and
+						passthrough modes is that, if you're not using an unbufferable
+						codec (opus, speex and g729), you can still use START_MEDIA_BUFFERING
+						to switch to buffered mode to send a file, then when you call
+						STOP_MEDIA_BUFFERING, the channel will go back into unbuffered
+						mode.
 						</para>
 					</enum>
 					<enum name="v(uri_parameters) - Add parameters to the outbound URI">

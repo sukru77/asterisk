@@ -41,3 +41,8 @@ tests/CI/output
 .devcontainer/
 .claude/
 /.idea/
+.clangd
+.clang-format
+.clang-tidy
+compile_commands.json
+.cache/
