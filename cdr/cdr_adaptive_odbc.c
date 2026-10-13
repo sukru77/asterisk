@@ -467,8 +467,14 @@ static int odbc_log(struct ast_cdr *cdr)
 						ast_cdr_format_var(cdr, entry->name, &colptr, colbuf, sizeof(colbuf), 0);
 					}
 
-					/* Truncate too-long fields */
-					if (entry->type != SQL_GUID) {
+					/* Truncate too-long fields.
+					 * MariaDB ODBC reports JSON columns with size and octet
+					 * length 0. Zero means the length is unknown, not that the
+					 * column holds zero bytes. Truncating there stores an
+					 * empty string, which a JSON column rejects, and the
+					 * whole CDR row is lost.
+					 */
+					if (entry->type != SQL_GUID && entry->octetlen > 0) {
 						if (strlen(colptr) > entry->octetlen) {
 							colptr[entry->octetlen] = '\0';
 						}
