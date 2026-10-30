@@ -312,6 +312,12 @@
 				<variable name="DIALEDPEERNUMBER">
 					<para>Resource of the agent that was dialed set on the outbound channel.</para>
 				</variable>
+				<variable name="QUEUEHINTEXTEN">
+					<para>Extension of the member hint, set on the outbound channel when the member state interface is a hint.</para>
+				</variable>
+				<variable name="QUEUEHINTCONTEXT">
+					<para>Context of the member hint, set on the outbound channel when the member state interface is a hint.</para>
+				</variable>
 				<variable name="QUEUE_WITHDRAW_INFO">
 					<para>If the call was successfully withdrawn from the queue, and the withdraw request was provided with optional withdraw info, the withdraw info will be stored in this variable.</para>
 				</variable>
@@ -5109,6 +5115,12 @@ static int ring_entry(struct queue_ent *qe, struct callattempt *tmp, int *busies
 
 	/* location is tmp->interface where tech/ has been stripped, so it follow the same syntax as DIALEDPEERNUMBER in app_dial.c */
 	pbx_builtin_setvar_helper(tmp->chan, "DIALEDPEERNUMBER", strlen(location) ? location : tmp->interface);
+	/* A Local member's dialplan cannot see the state interface. Copy a hint
+	 * so the dialplan can skip the call when every device in it is unavailable. */
+	if (tmp->member && !ast_strlen_zero(tmp->member->state_exten)) {
+		pbx_builtin_setvar_helper(tmp->chan, "QUEUEHINTEXTEN", tmp->member->state_exten);
+		pbx_builtin_setvar_helper(tmp->chan, "QUEUEHINTCONTEXT", tmp->member->state_context);
+	}
 
 	/* PREDIAL: Run gosub on the callee's channel */
 	if (qe->predial_callee) {
